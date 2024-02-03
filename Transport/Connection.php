@@ -120,10 +120,11 @@ class Connection
 
         $this->connectionOptions = array_replace_recursive([
             'delay' => [
-                'exchange_name' => 'delays',
-                'queue_name_pattern' => 'delay_%exchange_name%_%routing_key%_%delay%',
+                'exchange_name_pattern' => 'delay_%exchange_name%',
+                'queue_name_pattern' => 'delay_%exchange_name%',
             ],
         ], $connectionOptions);
+
         $this->autoSetupExchange = $this->autoSetupDelayExchange = $connectionOptions['auto_setup'] ?? true;
         $this->exchangeOptions = $exchangeOptions;
         $this->queuesOptions = $queuesOptions;
@@ -302,23 +303,13 @@ class Connection
     {
         $this->clearWhenDisconnected();
 
-        if ($this->autoSetupExchange) {
-            $this->setupExchangeAndQueues(); // also setup normal exchange for delayed messages so delay queue can DLX messages to it
-        }
-
         if (0 !== $delayInMs) {
             $this->publishWithDelay($body, $headers, $delayInMs, $amqpStamp);
 
             return;
         }
 
-        $this->publishOnExchange(
-            $this->exchange(),
-            $body,
-            $this->getRoutingKeyForMessage($amqpStamp),
-            $headers,
-            $amqpStamp
-        );
+        $this->publishNow($body, $headers, $amqpStamp);
     }
 
     /**
@@ -334,64 +325,88 @@ class Connection
     /**
      * @throws \AMQPException
      */
-    private function publishWithDelay(string $body, array $headers, int $delay, ?AmqpStamp $amqpStamp = null)
+    private function publishWithDelay(string $body, array $headers, int $delay, ?AmqpStamp $amqpStamp = null): void
     {
-        $routingKey = $this->getRoutingKeyForMessage($amqpStamp);
-        $isRetryAttempt = $amqpStamp ? $amqpStamp->isRetryAttempt() : false;
+        if ($this->autoSetupDelayExchange) {
+            $this->setupDelayExchangeAndQueues();
+        }
 
-        $this->setupDelay($delay, $routingKey, $isRetryAttempt);
+        $attributes = $this->getPublishAttributes($headers, $amqpStamp);
+
+        $attributes['expiration'] = $delay;
 
         $this->publishOnExchange(
-            $this->getDelayExchange(),
+            $this->delayExchange(),
             $body,
-            $this->getRoutingKeyForDelay($delay, $routingKey, $isRetryAttempt),
-            $headers,
-            $amqpStamp
+            $this->getRoutingKeyForMessage($amqpStamp),
+            $this->getPublishFlags($amqpStamp),
+            $attributes
         );
     }
 
-    private function publishOnExchange(\AMQPExchange $exchange, string $body, ?string $routingKey = null, array $headers = [], ?AmqpStamp $amqpStamp = null)
+    /**
+     * @throws \AMQPException
+     */
+    private function publishNow(string $body, array $headers, ?AmqpStamp $amqpStamp = null): void
+    {
+        if ($this->autoSetupExchange) {
+            $this->setupExchangeAndQueues();
+        }
+
+        $this->publishOnExchange(
+            $this->exchange(),
+            $body,
+            $this->getRoutingKeyForMessage($amqpStamp),
+            $this->getPublishFlags($amqpStamp),
+            $this->getPublishAttributes($headers, $amqpStamp)
+        );
+    }
+
+    private function getPublishAttributes(array $headers = [], ?AmqpStamp $amqpStamp = null): array
     {
         $attributes = $amqpStamp ? $amqpStamp->getAttributes() : [];
         $attributes['headers'] = array_merge($attributes['headers'] ?? [], $headers);
         $attributes['delivery_mode'] = $attributes['delivery_mode'] ?? 2;
         $attributes['timestamp'] = $attributes['timestamp'] ?? time();
 
+        return $attributes;
+    }
+
+    private function getPublishFlags(?AmqpStamp $amqpStamp = null): int
+    {
+        return $amqpStamp ? $amqpStamp->getFlags() : \AMQP_NOPARAM;
+    }
+
+    private function publishOnExchange(\AMQPExchange $exchange, string $body, ?string $routingKey = null, int $flags = \AMQP_NOPARAM, array $attributes = []): void
+    {
         $this->lastActivityTime = time();
 
-        $exchange->publish(
-            $body,
-            $routingKey,
-            $amqpStamp ? $amqpStamp->getFlags() : \AMQP_NOPARAM,
-            $attributes
-        );
+        $exchange->publish($body, $routingKey, $flags, $attributes);
 
         if ('' !== ($this->connectionOptions['confirm_timeout'] ?? '')) {
             $this->channel()->waitForConfirm((float) $this->connectionOptions['confirm_timeout']);
         }
     }
 
-    private function setupDelay(int $delay, ?string $routingKey, bool $isRetryAttempt)
+    private function delayExchange(): \AMQPExchange
     {
-        if ($this->autoSetupDelayExchange) {
-            $this->setupDelayExchange();
-        }
-
-        $queue = $this->createDelayQueue($delay, $routingKey, $isRetryAttempt);
-        $queue->declareQueue(); // the delay queue always need to be declared because the name is dynamic and cannot be declared in advance
-        $queue->bind($this->connectionOptions['delay']['exchange_name'], $this->getRoutingKeyForDelay($delay, $routingKey, $isRetryAttempt));
-    }
-
-    private function getDelayExchange(): \AMQPExchange
-    {
-        if (null === $this->amqpDelayExchange) {
+        if (!isset($this->amqpDelayExchange)) {
             $this->amqpDelayExchange = $this->amqpFactory->createExchange($this->channel());
-            $this->amqpDelayExchange->setName($this->connectionOptions['delay']['exchange_name']);
-            $this->amqpDelayExchange->setType(\AMQP_EX_TYPE_DIRECT);
+            $this->amqpDelayExchange->setName($this->getDelayExchangeName());
+            $this->amqpDelayExchange->setType(\AMQP_EX_TYPE_FANOUT);
             $this->amqpDelayExchange->setFlags(\AMQP_DURABLE);
         }
 
         return $this->amqpDelayExchange;
+    }
+
+    private function getDelayExchangeName(): string
+    {
+        return str_replace(
+            '%exchange_name%',
+            $this->exchangeOptions['name'],
+            $this->connectionOptions['delay']['exchange_name_pattern']
+        );
     }
 
     /**
@@ -403,36 +418,23 @@ class Connection
      * which is the original exchange, resulting on it being put back into
      * the original queue.
      */
-    private function createDelayQueue(int $delay, ?string $routingKey, bool $isRetryAttempt): \AMQPQueue
+    private function createDelayQueue(): \AMQPQueue
     {
         $queue = $this->amqpFactory->createQueue($this->channel());
-        $queue->setName($this->getRoutingKeyForDelay($delay, $routingKey, $isRetryAttempt));
+        $queue->setName($this->getDelayQueueName());
         $queue->setFlags(\AMQP_DURABLE);
-        $queue->setArguments([
-            'x-message-ttl' => $delay,
-            // delete the delay queue 10 seconds after the message expires
-            // publishing another message redeclares the queue which renews the lease
-            'x-expires' => $delay + 10000,
-            // message should be broadcast to all consumers during delay, but to only one queue during retry
-            // empty name is default direct exchange
-            'x-dead-letter-exchange' => $isRetryAttempt ? '' : $this->exchangeOptions['name'],
-            // after being released from to DLX, make sure the original routing key will be used
-            // we must use an empty string instead of null for the argument to be picked up
-            'x-dead-letter-routing-key' => $routingKey ?? '',
-        ]);
+        $queue->setArguments(['x-dead-letter-exchange' => $this->exchangeOptions['name']]);
 
         return $queue;
     }
 
-    private function getRoutingKeyForDelay(int $delay, ?string $finalRoutingKey, bool $isRetryAttempt): string
+    private function getDelayQueueName(): string
     {
-        $action = $isRetryAttempt ? '_retry' : '_delay';
-
         return str_replace(
-            ['%delay%', '%exchange_name%', '%routing_key%'],
-            [$delay, $this->exchangeOptions['name'], $finalRoutingKey ?? ''],
+            '%exchange_name%',
+            $this->exchangeOptions['name'],
             $this->connectionOptions['delay']['queue_name_pattern']
-        ).$action;
+        );
     }
 
     /**
@@ -468,7 +470,7 @@ class Connection
     public function setup(): void
     {
         $this->setupExchangeAndQueues();
-        $this->setupDelayExchange();
+        $this->setupDelayExchangeAndQueues();
     }
 
     private function setupExchangeAndQueues(): void
@@ -484,9 +486,14 @@ class Connection
         $this->autoSetupExchange = false;
     }
 
-    private function setupDelayExchange(): void
+    private function setupDelayExchangeAndQueues(): void
     {
-        $this->getDelayExchange()->declareExchange();
+        $this->delayExchange()->declareExchange();
+
+        $queue = $this->createDelayQueue();
+        $queue->declareQueue();
+        $queue->bind($this->getDelayExchangeName());
+
         $this->autoSetupDelayExchange = false;
     }
 
@@ -500,7 +507,7 @@ class Connection
 
     public function channel(): \AMQPChannel
     {
-        if (null === $this->amqpChannel) {
+        if (!isset($this->amqpChannel)) {
             $connection = $this->amqpFactory->createConnection($this->connectionOptions);
             $connectMethod = 'true' === ($this->connectionOptions['persistent'] ?? 'false') ? 'pconnect' : 'connect';
 
@@ -553,7 +560,7 @@ class Connection
 
     public function exchange(): \AMQPExchange
     {
-        if (null === $this->amqpExchange) {
+        if (!isset($this->amqpExchange)) {
             $this->amqpExchange = $this->amqpFactory->createExchange($this->channel());
             $this->amqpExchange->setName($this->exchangeOptions['name']);
             $this->amqpExchange->setType($this->exchangeOptions['type'] ?? \AMQP_EX_TYPE_FANOUT);
@@ -570,10 +577,8 @@ class Connection
     private function clearWhenDisconnected(): void
     {
         if (!$this->channel()->isConnected()) {
-            $this->amqpChannel = null;
+            unset($this->amqpChannel, $this->amqpExchange, $this->amqpDelayExchange);
             $this->amqpQueues = [];
-            $this->amqpExchange = null;
-            $this->amqpDelayExchange = null;
         }
     }
 
@@ -582,7 +587,7 @@ class Connection
         return $this->exchangeOptions['default_publish_routing_key'] ?? null;
     }
 
-    public function purgeQueues()
+    public function purgeQueues(): void
     {
         foreach ($this->getQueueNames() as $queueName) {
             $this->queue($queueName)->purge();
