@@ -122,6 +122,7 @@ class Connection
             'delay' => [
                 'exchange_name_pattern' => 'delay_%exchange_name%',
                 'queue_name_pattern' => 'delay_%exchange_name%',
+                'queue_expires' => 0,
             ],
         ], $connectionOptions);
 
@@ -157,8 +158,9 @@ class Connection
      *     * flags: Exchange flags (Default: AMQP_DURABLE)
      *     * arguments: Extra arguments
      *   * delay:
-     *     * queue_name_pattern: Pattern to use to create the queues (Default: "delay_%exchange_name%_%routing_key%_%delay%")
-     *     * exchange_name: Name of the exchange to be used for the delayed/retried messages (Default: "delays")
+     *     * exchange_name_pattern: Pattern to use to create the delay exchange (Default: "delay_%exchange_name%")
+     *     * queue_name_pattern: Pattern to use to create the delay queues (Default: "delay_%exchange_name%")
+     *     * queue_expires: Controls for how long a delay queue can be unused before it is automatically deleted. Note: 0 or greater milliseconds.
      *   * auto_setup: Enable or not the auto-setup of queues and exchanges (Default: true)
      *
      *   * Connection tuning options (see http://www.rabbitmq.com/amqp-0-9-1-reference.html#connection.tune for details):
@@ -412,7 +414,7 @@ class Connection
     /**
      * Creates a delay queue that will delay for a certain amount of time.
      *
-     * This works by setting message TTL for the delay and pointing
+     * This works by setting message TTL (expiration argument) for the delay and pointing
      * the dead letter exchange to the original exchange. The result
      * is that after the TTL, the message is sent to the dead-letter-exchange,
      * which is the original exchange, resulting on it being put back into
@@ -423,7 +425,14 @@ class Connection
         $queue = $this->amqpFactory->createQueue($this->channel());
         $queue->setName($this->getDelayQueueName());
         $queue->setFlags(\AMQP_DURABLE);
-        $queue->setArguments(['x-dead-letter-exchange' => $this->exchangeOptions['name']]);
+
+        $expires = (int)($this->connectionOptions['delay']['queue_expires'] ?? 0);
+        $arguments = ['x-dead-letter-exchange' => $this->exchangeOptions['name']];
+        if ($expires > 0) {
+            $arguments['x-expires'] = $expires;
+        }
+
+        $queue->setArguments($arguments);
 
         return $queue;
     }
